@@ -16,18 +16,17 @@
 
 ---
 
-## 📋 Requirements
+## 📋 Requirements & Environment
 
-* **OS:** Linux (Tested on Kali Linux / Ubuntu)
+* **OS:** Tested and verified on **BlackArch Linux** / Kali Linux
 * **Python:** Python 3.x
-* **Python Libraries:** `scapy`
+* **Dependencies:** `scapy`
 
 ---
 
 ## ⚙️ Installation
 
 1. Clone or download the repository to your local machine.
-2. Install the required Python dependencies (Scapy):
+2. Ensure Python and Scapy are installed on your system (BlackArch usually comes with Scapy pre-installed, or you can install via pacman/pip if needed):
    ```bash
-   sudo apt update
-   sudo apt install python3-scapy
+   sudo pacman -S python-scapy
