@@ -16,7 +16,7 @@
 * **Interactive Main Menu Loop:** Runs continuously; once a sniffing session or timeout completes, it automatically restores the network and returns you to the menu to pick a new target without restarting the script.
 * **Robust Error Handling:** Built-in fault tolerance that prompts you dynamically if a target goes offline or fails to respond.
 * **Clean Exit & Restoration:** Automatically restores original network ARP tables, disables IP forwarding, and exits safely.
-
+![Main Screen](./screenshots/main.png)
 ---
 
 ## 📋 Requirements & Environment
